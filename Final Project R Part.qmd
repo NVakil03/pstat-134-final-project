@@ -1,0 +1,640 @@
+---
+title: "Building a Yelp Recommender System - Final Project"
+author: "Tobias Starling, Deanna Hu, Nabeel Vakil, Derek Gong - PSTAT 134"
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 4
+    embed-resources: true
+    theme: simplex
+    code-fold: show
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+# Introduction
+
+## Project Scope
+
+The goal of our group was to implement a Yelp recommender system that would return ten restaurant recommendations when given either a user or restaurant. We built a collaborative filtering recommendation system using a K-Nearest Neighbors model with cosine similarity and content-based filtering. We also integrated a Natural Language Processing element to analyze the general sentiment of written reviews and further refine our model.
+
+## Data Cleaning
+
+We got our data set from an open-source Yelp API data set that contained over 7 million data points from all types of businesses across the US. https://business.yelp.com/data/resources/open-dataset/
+
+We began by filtering the data so that we were only looking at information relevant to our project. We specified that our data set should only include restaurants located in California that had three or more stars and a review count greater than 100. The thought process behind this was that testing our model in California, mostly Santa Barbara, would be the most efficient because we all have local knowledge of the area. We didn't want our system to return any bad restaurants to a user and felt that having over 100 reviews and more than three stars was essential to a restaurant's credibility.
+
+### Upload Files
+
+Loading the necessary libraries:
+
+```{r, message=FALSE}
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(reticulate)
+library(ggplot2)
+library(wordcloud)
+library(naniar)
+library(tidymodels)
+library(stringr)
+library(fs)
+library(tidytext)
+library(kableExtra)
+```
+
+```{r, eval = FALSE}
+businesses <- stream_in(file("/Users/deannahu/Documents/UCSB/PSTAT 134/Project/Yelp JSON/yelp_dataset/yelp_academic_dataset_business.json"))
+reviews <- stream_in(file("/Users/deannahu/Documents/UCSB/PSTAT 134/Project/Yelp JSON/yelp_dataset/yelp_academic_dataset_review.json"))
+tips <- stream_in(file("/Users/deannahu/Documents/UCSB/PSTAT 134/Project/Yelp JSON/yelp_dataset/yelp_academic_dataset_tip.json"))
+users <- stream_in(file("/Users/deannahu/Documents/UCSB/PSTAT 134/Project/Yelp JSON/yelp_dataset/yelp_academic_dataset_user.json"))
+```
+
+### Variables of Interest
+
+The variables of interest that we pulled from the dataset include: price, location, type of restaurant, and number of stars. Luckily, the downloaded dataset didn't contain any missing information in our categories of interest. It only contained missing data in categories irrelevant to us, such as whether the restaurant accepted Cryptocurrency or not, so we didn't have to create any processes to handle missing data. We also took into account another variable called weighted sentiment. This is where we implemented Natural Language Processing on written reviews to assess the service, atmosphere, and quality of food associated with recommended restaurants.
+
+Creating a list of business IDs that are restaurants/eateries:
+
+```{r, eval = FALSE}
+# Cleaning businesses.json
+# Select columns: business_id, name, city, state, postal code, stars, categories, attributes
+head(businesses)
+businesses1 <- businesses %>%
+  select(business_id, name, address, city, state, postal_code, stars, review_count, categories)
+restaurants_only <- businesses1 %>%
+  filter(!duplicated(business_id)) %>% #remove duplicates
+  filter(grepl(c("Restaurants|Food|Breweries|Fast Food|Pubs|Burgers|Korean|Vietnamese|Food Trucks|Diners|Delis|Bakeries|Gastropubs|Cafes|Steakhouses|Bars|Pizza|Sandwiches"), categories)) %>%
+  filter(stars >= 2.5)
+cali_only <- restaurants_only %>%
+  filter(grepl("CA", state))
+
+# Cleaning reviews.json
+head(reviews)
+restaurant_reviews <- reviews %>%
+  inner_join(restaurants_only, by = join_by(business_id)) 
+restaurant_reviews <- restaurant_reviews %>%
+  select(-c(address, city, state, postal_code, stars.y, categories))
+
+# Cleaning tips.json
+head(tips)
+restaurant_tips <- tips %>%
+  inner_join(restaurants_only, by = join_by(business_id))
+restaurant_tips <- restaurant_tips %>%
+  select(-c(X.1, X, address, city, state, postal_code, stars, review_count, categories))
+
+# Cleaning users.json
+head(users)
+users1 <- users %>%
+  filter(!duplicated(user_id)) %>% #remove duplicate user values if any
+  select(c(user_id, review_count, yelping_since, useful, funny, cool, fans, average_stars))
+# Sort highest to lowest
+users_cleaned <- users1 %>%
+  filter(review_count > 0) %>% #delete users with no reviews
+  arrange(desc(review_count))
+users_cleaned <- users_cleaned %>%
+  select(-c(X, X.1))
+```
+
+Exporting the list of business IDs with their data, and selecting reviews for those business IDs (also exporting into csv files):
+
+```{r, eval = FALSE}
+write.csv(restaurants_only, file = "yelp_restaurants.csv")
+write.csv(restaurant_reviews, file = "yelp_restaurant_reviews.csv")
+write.csv(users_cleaned, file = "users_cleaned.csv")
+write.csv(restaurant_tips, file = "tips_cleaned.csv")
+```
+
+Loading pre-saved CSV files instead of the full JSON files:
+
+```{r}
+restaurants_only <- read.csv(file = "yelp_restaurants.csv")
+restaurant_reviews <- read.csv(file = "yelp_restaurant_reviews.csv")
+restaurant_tips <- read.csv(file = "tips_cleaned.csv")
+users_cleaned <- read.csv(file = "users_cleaned.csv")
+```
+
+Viewing cleaned files:
+
+```{r}
+head(restaurants_only)
+head(restaurant_reviews)
+head(restaurant_tips)
+head(users_cleaned)
+```
+
+Checking for any missing data:
+
+```{r}
+# Checking missing values
+restaurants_only %>% 
+  vis_miss()
+```
+
+As seen, there are no missing values in any column (except for when considering attributes and hours for the restaurant, which are not relevant to us).
+
+## Data Visualization
+
+### User data visualizations
+
+```{r}
+head(users_cleaned)
+users_cleaned <- users_cleaned %>%
+  mutate(year_created = as.numeric(substr(yelping_since, 1, 4))) %>%
+  mutate(review_count_group = cut(review_count, 
+                breaks = c(-Inf, 10, 50, 100, 500, 1000, 2000, 5000, 10000, Inf), 
+                labels = c("<10", "10-50", "50-100", "100-500", "500-1000", "1000-2000", "2000-5000", "5000-10000", "10000+"),
+                right = FALSE)) %>%
+mutate(useful_count_group = cut(useful, 
+                breaks = c(-Inf, 10, 50, 100, 500, 1000, 2000, 5000, 10000, Inf), 
+                labels = c("<10", "10-50", "50-100", "100-500", "500-1000", "1000-2000", "2000-5000", "5000-10000", "10000+"),
+                right = FALSE)) %>%
+mutate(funny_count_group = cut(funny, 
+                breaks = c(-Inf, 10, 50, 100, 500, 1000, 2000, 5000, 10000, Inf), 
+                labels = c("<10", "10-50", "50-100", "100-500", "500-1000", "1000-2000", "2000-5000", "5000-10000", "10000+"),
+                right = FALSE))
+```
+
+To more easily visualize the distribution of data in this dataset, we have split the data into ranges. When initially graphing the data, the values were largely skewed right and hard to distinguish meaning from.
+
+```{r}
+# Distribution of Number of Reviews 
+ggplot(users_cleaned, aes(x=log(review_count))) + 
+  geom_boxplot() + 
+  labs(title="Boxplot of Number of Reviews")
+ggplot(users_cleaned, aes(x=review_count_group)) + 
+  geom_bar(color="black", fill="white") +
+  labs(title="Distribution of Number of Reviews", x="Number of Reviews", y="Number of Users")
+```
+
+This graph gives the number of reviews users across Yelp have written. The review_count was log transformed to better view the distribution of review counts.
+
+```{r}
+# Boxplot of star distributions
+ggplot(users_cleaned, aes(x=average_stars)) + 
+  geom_boxplot()
+```
+
+This graph shows the distribution of stars that users rate on average.
+
+```{r}
+# Star distribution of users with 500+ reviews
+users_1000_plus <- users_cleaned %>%
+  filter(review_count >= 1000)
+ggplot(users_1000_plus, aes(x=average_stars)) + 
+  geom_boxplot() +
+  labs(title="Distribution of Average Stars for Users with 1000 or More Reviews", x="Stars")
+```
+
+Users that have reviewed more restaurants are more likely to have a more nuanced average rating than users that have only reviewed a few—say only their favorite restaurants, or restaurants where service was horrible.
+
+```{r}
+# Star distribution of users with <=50 reviews
+users_less_than_10 <- users_cleaned %>%
+  filter(review_count <= 10)
+ggplot(users_less_than_10, aes(x=average_stars)) + 
+  geom_boxplot() + 
+  labs(title="Distribution of Average Stars for Users with 10 or Less Reviews", x="Stars")
+```
+
+We can see in the graph results that average user stars for those with less than 10 reviews under their profile is more positive than those with 500+ reviews.
+
+```{r}
+# Average Star Distributions
+ggplot(users_cleaned, aes(x=average_stars)) + 
+  geom_histogram(binwidth = 1, color="black", fill="white") + 
+  geom_vline(aes(xintercept=mean(average_stars)),
+            color="red", linetype="dashed", size=1) +
+  labs(title="Distribution of Average Stars Given", x="Average Stars", y="Number of Users")
+```
+
+This graph shows the distribution of average stars given across users in the Yelp platform. The red line indicates the mean number of stars.
+
+```{r}
+# Distribution of User Profile Ages
+ggplot(users_cleaned, aes(x=year_created)) + 
+  geom_histogram(binwidth = 1, color="black", fill="white") + 
+  geom_vline(aes(xintercept=mean(year_created)),
+            color="red", linetype="dashed", size=1) +
+  labs(title="Distribution of Account Age", x="Year the Account was Created", y="Number of Users")
+```
+
+This graph gives a glimpse of the age of user profiles. A majority of accounts were created in recent years.
+
+```{r}
+# Histogram of useful reviews
+ggplot(users_cleaned, aes(x = useful_count_group)) + 
+  geom_bar(color="black", fill="white") +
+  labs(title="Distribution of 'Useful' Kudos Received", x="'Useful' Received", y="Number of Users")
+```
+
+```{r}
+# Scatterplot of review count vs account age (year)
+ggplot(users_cleaned, aes(x=year_created, y=review_count)) +
+  geom_point() +
+  labs(title="Year Created vs. Account Age (Years)", x="Year Created", y="Number of Reviews")
+```
+
+This graph shows the relationship between how many reviews a user has written, versus how old their account is. Older accounts are likely to have written more reviews, as expected.
+
+```{r}
+# Histogram of useful reviews
+ggplot(users_cleaned, aes(x = useful_count_group)) + 
+  geom_bar(color="black", fill="white") +
+  labs(title="Distribution of 'Useful' Kudos Received", x="'Useful' Received", y="Number of Users")
+```
+
+This graph shows the distribution of "useful" kudos received.
+
+```{r}
+# Histograms of fans
+ggplot(users_cleaned, aes(x = log(fans))) + 
+  geom_histogram(binwidth = 1, color="black", fill="white") +
+  labs(title="Distribution of Account Fans", x="Fans", y="Number of Users")
+```
+
+This graph shows the distribution of fans that user profiles have. Fans count was log transformed to better visualize the distribution.
+
+### Restaurant visualizations
+
+```{r}
+# Distribution of number of reviews
+ggplot(restaurants_only, aes(x=review_count)) +
+  geom_histogram()
+```
+
+This graph shows the distribution in the number of reviews restaurants tend to receive. Restaurants with higher number of reviews tend to also have a higher average star rating. This makes sense intuitively because if a restaurant is good, then it would attract others to visit that restaurant as well.
+
+```{r}
+# Review count vs rating scatter plot
+ggplot(restaurants_only, aes(x=review_count, y=stars)) +
+  geom_point()
+```
+
+This graph compares the average stars of a restaurant versus how many reviews they received.
+
+### Review visualizations
+
+```{r}
+#cleaning data
+restaurant_reviews <- restaurant_reviews %>%
+  mutate(review_year = as.numeric(substr(date, 1, 4))) %>%
+  mutate(review_month = as.numeric(substr(date, 6, 7))) %>%
+  rename(stars = stars.x) %>%
+  select(-c(date, review_count)) %>%
+  mutate(review_month = month.name[review_month]) %>%
+  mutate(over_3_stars = ifelse(stars>=3, "Yes", "No")) #1 for yes, 0 for no
+```
+
+We cleaned the review data by splitting up the date string into year and month separately, as well as grouping reviews into those with more than 3 stars, and those with less than 3 stars.
+
+```{r}
+# distribution of reviews given by year
+ggplot(restaurant_reviews, aes(x=review_year)) + 
+  geom_bar(color="black", fill="white") +
+  labs(title="Distribution of Review Years", x="Year", y="Number of Reviews") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5)) +
+  scale_x_continuous(breaks=seq(2005,2022,1))
+```
+
+This graphs shows when reviews were published by year, showing both the popularity of the app, as well as the popularity of eating out over the past 20 years. Interestingly, there is a massive decrease from the year 2019 to 2020 in reviews, likely due to the COVID-19 pandemic.
+
+```{r}
+# distribution of reviews given by month
+ggplot(restaurant_reviews, aes(x=review_month)) + 
+  geom_bar(color="black", fill="white") +
+  labs(title="Distribution of Review Months", x="Month", y="Number of Reviews") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+
+This graph shows when reviews were written by month. This would show if there are any seasonal patterns to when users eat out at restaurants more often.
+
+```{r}
+# Positive vs negative reviews (over 3 stars)
+ggplot(restaurant_reviews, aes(x=over_3_stars)) +
+  geom_bar(color="black", fill="white") +
+  labs(title="Positive vs. Negative Reviews Based on Rating", x="Over 3 Stars", "Number of Reviews") 
+```
+
+This graph compares the number of positive reviews are on the app, versus negative reviews. Users tend to only review restaurants they have a positive experience at.
+
+```{r}
+# Distribution of useful reviews
+ggplot(restaurant_reviews, aes(x=useful)) +
+  geom_bar()
+```
+
+This graph shows the distribution of reviews that were given "useful" kudos.
+
+```{r}
+# word cloud of most common words in reviews
+# take sample
+review_sample <- restaurant_reviews %>%
+  sample_n(size = 10000, replace=FALSE)
+
+# Clean the reviews
+review_sample$text <- review_sample$text %>% 
+  str_remove_all('\'') %>%
+  str_replace_all("([a-z])([A-Z])", "\\1 \\2") %>%
+  tolower() %>%
+  str_replace_all("\\s+", " ")
+restaurant_reviews_tokenized <- review_sample %>% 
+  unnest_tokens(word, text) %>% 
+  anti_join(stop_words)
+
+wordcloud(restaurant_reviews_tokenized$word,
+        , scale=c(5,0.5)     # Set min and max scale
+        , max.words=100      # Set top n words
+        , random.order=FALSE)
+```
+
+This is a word cloud of common words found in all restaurant reviews. To prepare the data for word clouds, we took a random sample of reviews, cleaned the strings, and then tokenized the reviews by word.
+
+```{r}
+# word cloud of most common words in reviews for under 3 stars
+restaurant_reviews_tokenized_neg <- restaurant_reviews_tokenized %>%
+  filter(over_3_stars == "No")
+
+wordcloud(restaurant_reviews_tokenized_neg$word,
+        , scale=c(5,0.5)     # Set min and max scale
+        , max.words=100      # Set top n words
+        , random.order=FALSE)
+```
+
+Since three stars is typically the cutoff between a good dining experience and a mediocre/bad one, the reviews for restaurants that got less than 3 stars are likely to have different common words than those that users enjoyed eating at.
+
+```{r}
+#word cloud of most common words in reviews for over 3 stars
+restaurant_reviews_tokenized_pos <- restaurant_reviews_tokenized %>%
+  filter(over_3_stars == "Yes")
+
+wordcloud(restaurant_reviews_tokenized_pos$word,
+        , scale=c(5,0.5)     # Set min and max scale
+        , max.words=100      # Set top n words
+        , random.order=FALSE)
+```
+
+This is a word cloud of common words in positive reviews.
+
+# Methods
+
+## Natural Language Processing
+
+To enhance the accuracy of our Yelp recommender system, we integrated Natural Language Processing (NLP) techniques to analyze user-written restaurant reviews. Traditional recommendation systems rely on numerical ratings and collaborative filtering; however, by incorporating sentiment analysis, we leveraged qualitative user feedback to refine our model and provide more personalized recommendations.
+
+Using the AFINN sentiment lexicon, we assigned sentiment scores to individual words in restaurant reviews. Our preprocessing steps included filtering the dataset to include California restaurants with at least 100 reviews, a 3-star minimum rating, and active business status. The review text was tokenized, stop words were removed, and sentiment scores were computed by summing the values of sentiment-bearing words in each review. A higher score indicated positive sentiment, while a lower score suggested negative sentiment.
+
+These sentiment scores were then integrated into our collaborative filtering model to adjust recommendation rankings. Restaurants with similar ratings and user interactions were further differentiated by sentiment scores, ensuring that businesses with consistently positive customer sentiment were prioritized. This hybrid approach enhances the accuracy and relevance of our recommendations by combining structured (ratings, user interactions) and unstructured (text reviews) data. The result is a more comprehensive and user-centric recommendation system that better aligns with real-world customer experiences.
+
+```{r}
+business_data <- readRDS("business_data.rds")
+review_data <- readRDS("review_data.rds")
+```
+
+```{r}
+#get_sentiments("afinn")
+afinn <- get_sentiments("afinn")
+data("stop_words")
+```
+
+### Lexicon
+
+```{r}
+# Filter businesses to include only those in California with:
+#   - at least 100 reviews
+#   - a star rating of at least 3
+#   - that are currently open
+#   - whose categories contain the string "Restaurants"
+filtered_businesses_CA <- business_data %>%
+    filter(
+    review_count >= 100,
+    stars >= 3,
+    is_open == 1,
+    state == 'CA',
+    sapply(categories, function(x) any(grepl("Restaurants", x)))
+  ) %>%
+  select(business_id, state, review_count,stars,is_open,categories)
+
+review_data_cleaned_CA <- review_data %>%
+  select(review_id, user_id, business_id, text, stars, useful) %>%
+  drop_na() %>%
+  semi_join(filtered_businesses_CA, by = "business_id")
+```
+
+```{r}
+# Clean the text in reviews.
+# Here, we remove digits and symbols, remove punctuation (except apostrophes), insert a space between lower and uppercase letters, convert to lowercase, and normalize whitespace.
+
+review_data_filtered_CA <- review_data_cleaned_CA
+review_data_filtered_CA$text <- review_data_filtered_CA$text %>%
+#  str_replace_all(pattern = "\n", " ") %>%
+  str_remove_all('[[:digit:]]') %>%
+  str_remove_all('[[:symbol:]]') %>%
+  str_replace_all("[[:punct:]&&[^']]", " ") %>%
+  str_replace_all("([a-z])([A-Z])", "\\1 \\2")  %>%
+  tolower() %>%
+  str_replace_all("\\s+", " ")
+```
+
+```{r}
+# Generate a table of common words/bigrams across all cleaned reviews in CA for lexicon.
+# Tokenize the text, remove stop words, and count frequency.
+
+common_words <- review_data_filtered_CA %>% 
+  unnest_tokens(word, text) %>% 
+  anti_join(stop_words) %>%
+#  inner_join(afinn) %>%
+  count(word, sort = TRUE)
+
+common_bigrams <- review_data_filtered_CA %>%
+  unnest_tokens(bigram, text, token = "ngrams", n = 2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  unite(bigram, word1, word2, sep = " ") %>%
+  count(bigram, sort = TRUE)
+
+# write.csv(common_bigrams, "common_bigrams.csv")
+```
+
+```{r}
+# Define domain-specific lexicons manually.
+
+price_terms <- c("price", "prices", "expensive", "priced", "pricey", "cheap", "generous", "affordable")
+
+service_terms <- c("service", "staff", "server", "served", "customer", "waiter", "waitress", "fast", 
+                   "owner", "manager", "customers", "quickly", "servers", "rude", "employees", 
+                   "serving", "welcoming", "waiters", "workers", "owners", "friendly staff", 
+                   "super friendly", "friendly service", "wait time")
+
+atmosphere_terms <- c("atmosphere", "ambiance", "ambience", "comfortable", "feeling", "romantic", 
+                      "environment", "mood", "quiet")
+```
+
+### Actual Work
+
+```{r}
+# Extract trigrams from the cleaned review text.
+# Tokenize the text into trigrams and then separate each trigram into three words.
+# Remove trigrams where any of the three words are stop words.
+review_data_trigrams <- review_data_filtered_CA %>%
+  unnest_tokens(trigram, text, token = "ngrams", n = 3) %>%
+  separate(trigram, into = c("word1", "word2", "word3"), sep = " ") %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>%
+  filter(!word3 %in% stop_words$word)
+```
+
+```{r}
+# Filter the trigrams to create domain-specific subsets.
+# For each domain, filter for trigrams where the middle word belongs to the respective lexicon.
+
+price_trigrams <- review_data_trigrams %>%
+  filter(word2 %in% price_terms)
+
+service_trigrams <- review_data_trigrams %>%
+  filter(word2 %in% service_terms)
+
+atmosphere_trigrams <- review_data_trigrams %>%
+  filter(word2 %in% atmosphere_terms)
+```
+
+```{r}
+# Obtain review counts per business from the original cleaned review dataset.
+# Each business_id gets a unique count of reviews.
+
+review_counts <- review_data_filtered_CA %>%
+  group_by(business_id) %>%
+  summarize(review_count = n(), .groups = "drop")
+```
+
+```{r}
+# For each trigrams, group by review_id and trigram components and then count occurrences.
+
+weighted_price <- price_trigrams %>%
+  group_by(review_id, word1, word2, word3, useful) %>%
+  reframe(counts = n(), across(everything())) %>%
+  ungroup() %>%
+  mutate(scaling_factor = 1 + log(useful + 1),   # Apply a scaling factor based on 'useful' (likes) using a logarithmic transformation.
+         weighted_count = counts * scaling_factor)
+
+# Join with the AFINN lexicon for each word in the trigram to obtain sentiment scores.
+# Replace missing sentiment scores with 0, then compute the average sentiment for the trigram.
+# Multiply the average sentiment by the weighted count to get a weighted sentiment score.
+
+price_sentiment <- weighted_price %>%
+  left_join(afinn, by = c("word1" = "word")) %>%
+  rename(score1 = value) %>%
+  left_join(afinn, by = c("word2" = "word")) %>%
+  rename(score2 = value) %>%
+  left_join(afinn, by = c("word3" = "word")) %>%
+  rename(score3 = value) %>%
+  mutate(score1 = if_else(is.na(score1), 0, score1),
+         score2 = if_else(is.na(score2), 0, score2),
+         score3 = if_else(is.na(score3), 0, score3),
+         avg_score = (score1 + score2 + score3) / 3,
+         weighted_score = avg_score * weighted_count)
+
+
+# Join with review counts and compute the final price domain score for each business.
+# Normalize the aggregated score by dividing by sqrt(review_count + 1) to dampen the influence of many reviews.
+
+price_domain_scores <- price_sentiment %>%
+  left_join(review_counts, by = "business_id") %>%
+  group_by(business_id) %>%
+  reframe(price_score = sum(weighted_score) / sqrt(first(review_count) + 1)) %>%
+  mutate(price_score = round(price_score, 3))
+```
+
+```{r}
+weighted_service <- service_trigrams %>%
+  group_by(review_id, word1, word2, word3, useful) %>%
+  reframe(counts = n(), across(everything())) %>%
+  ungroup() %>%
+  mutate(scaling_factor = 1 + log(useful + 1),
+         weighted_count = counts * scaling_factor)
+
+service_sentiment <- weighted_service %>%
+  left_join(afinn, by = c("word1" = "word")) %>%
+  rename(score1 = value) %>%
+  left_join(afinn, by = c("word2" = "word")) %>%
+  rename(score2 = value) %>%
+  left_join(afinn, by = c("word3" = "word")) %>%
+  rename(score3 = value) %>%
+  mutate(score1 = if_else(is.na(score1), 0, score1),
+         score2 = if_else(is.na(score2), 0, score2),
+         score3 = if_else(is.na(score3), 0, score3),
+         avg_score = (score1 + score2 + score3) / 3,
+         weighted_score = avg_score * weighted_count)
+
+service_domain_scores <- service_sentiment %>%
+  left_join(review_counts, by = "business_id") %>%
+  group_by(business_id) %>%
+  reframe(service_score = sum(weighted_score)/ sqrt(first(review_count) + 1)) %>%
+  mutate(service_score = round(service_score, 3))
+```
+
+```{r}
+weighted_atmosphere <- atmosphere_trigrams %>%
+  group_by(review_id, word1, word2, word3, useful) %>%
+  reframe(counts = n(), across(everything())) %>%
+  ungroup() %>%
+  mutate(scaling_factor = 1 + log(useful + 1),
+         weighted_count = counts * scaling_factor)
+
+atmosphere_sentiment <- weighted_atmosphere %>%
+  left_join(afinn, by = c("word1" = "word")) %>%
+  rename(score1 = value) %>%
+  left_join(afinn, by = c("word2" = "word")) %>%
+  rename(score2 = value) %>%
+  left_join(afinn, by = c("word3" = "word")) %>%
+  rename(score3 = value) %>%
+  mutate(score1 = if_else(is.na(score1), 0, score1),
+         score2 = if_else(is.na(score2), 0, score2),
+         score3 = if_else(is.na(score3), 0, score3),
+         avg_score = (score1 + score2 + score3) / 3,
+         weighted_score = avg_score * weighted_count)
+
+atmosphere_domain_scores <- atmosphere_sentiment %>%
+  left_join(review_counts, by = "business_id") %>%
+  group_by(business_id) %>%
+  reframe(atmosphere_score = sum(weighted_score)/ sqrt(first(review_count) + 1)) %>%
+  mutate(atmosphere_score = round(atmosphere_score, 3))
+```
+
+```{r}
+# Compute the overall sentiment score for each business from all words in the cleaned reviews.
+
+overall_sentiment <- review_data_filtered_CA %>%
+  unnest_tokens(word, text) %>%
+  left_join(afinn, by = "word") %>%  
+  mutate(value = if_else(is.na(value), 0, value)) %>%
+  count(business_id, word, value, sort = TRUE) %>%
+  bind_tf_idf(word, business_id, n) %>%
+  group_by(business_id) %>%
+  reframe(
+    weighted_sentiment = sum(value * tf_idf) / sum(tf_idf)
+  ) %>%
+  mutate(weighted_sentiment = round(weighted_sentiment, 3))
+```
+
+```{r}
+# Join overall sentiment with each domain's scores (price, service, and atmosphere).
+
+final_scores <- overall_sentiment %>%
+  left_join(price_domain_scores, by = "business_id") %>%
+  left_join(service_domain_scores, by = "business_id") %>%
+  left_join(atmosphere_domain_scores, by = "business_id") %>%
+  mutate(across(where(is.numeric), ~ replace_na(.x, 0)))
+```
+
+```{r, eval = FALSE}
+write.csv(final_scores, "final_scores.csv")
+```
+
+## Recommender System
+
+We move on to our recommender system in Python because of its extensive ecosystem, ease of use, scalability, and industry adoption. What really gives Python the advantage is the fact that it can feasibly perform complicated operations on large data frames, which is needed for this kind of project.
